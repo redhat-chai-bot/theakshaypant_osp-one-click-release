@@ -351,7 +351,6 @@ execute_1_8() {
         return 2
       fi
     done < <(jq -r '.[].url' <<<"${prs}")
-    return
   fi
 
   mismatches=$(<"${REPORT_BASE}/.state/opc-version-mismatches")
