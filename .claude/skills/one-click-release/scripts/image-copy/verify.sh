@@ -50,7 +50,7 @@ verify_3_2() {
   while IFS=$'\t' read -r _release _rp _status image _ocp target _snapshot; do
     ((count += 1))
     source_digest=${image##*@}
-    inspected=$(skopeo inspect --no-tags "docker://${target}" 2>/dev/null || true)
+    inspected=$(skopeo inspect --no-tags --override-arch amd64 --override-os linux "docker://${target}" 2>/dev/null || true)
     target_digest=$(jq -r '.Digest // empty' <<<"${inspected:-{}}" 2>/dev/null || true)
     [[ "${target_digest}" == "${source_digest}" ]] || ((bad += 1))
   done <"${state}"

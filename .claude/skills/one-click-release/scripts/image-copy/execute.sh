@@ -88,7 +88,7 @@ execute_3_2() {
   fi
   local first_image
   first_image=$(awk -F'\t' 'NR==1 {print $4}' "${state}")
-  if [[ -z "${first_image}" ]] || ! skopeo inspect --no-tags "docker://${first_image}" >/dev/null 2>&1; then
+  if [[ -z "${first_image}" ]] || ! skopeo inspect --no-tags --override-arch amd64 --override-os linux "docker://${first_image}" >/dev/null 2>&1; then
     printf 'IIB registry is not reachable (VPN?); generating the deferred VPN copy script.\n'
     write_copy_script "${state}"
     return
