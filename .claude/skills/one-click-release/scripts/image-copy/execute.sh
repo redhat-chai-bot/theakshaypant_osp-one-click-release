@@ -24,7 +24,7 @@ execute_3_1() {
 }
 
 image_digest() {
-  skopeo inspect --no-tags --format '{{.Digest}}' "docker://$1" 2>/dev/null
+  skopeo inspect --no-tags --override-arch amd64 --override-os linux --format '{{.Digest}}' "docker://$1" 2>/dev/null
 }
 
 # Step 3.1 prerequisite: every index stage release Succeeded with an IIB image.
