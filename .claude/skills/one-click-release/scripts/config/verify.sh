@@ -30,7 +30,7 @@ ocr_step_title() {
     1.9) printf '%s' 'p12n-opc sync' ;;
     1.10) printf '%s' 'serve-tkn-cli submodules' ;;
     1.11) printf '%s' 'CLI product version config' ;;
-    1.12) printf '%s' 'CLI CDN RP/RPA' ;;
+    1.12) printf '%s' 'RP tags + CDN RP/RPA' ;;
   esac
 }
 
@@ -504,47 +504,76 @@ verify_1_11() {
 }
 
 verify_1_12() {
-  ocr_require_gitlab || return $?
-  local base rpa rp_sub auto rpa_count rp_count auto_count
-  local mm_dot="${MAJOR_MINOR}"  # e.g. 1.23
+  # ── Part 1: CDN RPAs exist in konflux-release-data (if GITLAB_TOKEN is set) ──
+  local rpa_count=0
+  if [[ -n "${GITLAB_URL:-}" && -n "${GITLAB_TOKEN:-}" ]]; then
+    local rpa_data
+    rpa_data=$(ocr_gitlab_get \
+      "${GITLAB_URL}/api/v4/projects/releng%2Fkonflux-release-data/repository/tree?path=config/kflux-prd-rh02.0fk9.p1/product/ReleasePlanAdmission/tekton-ecosystem&ref=main&per_page=100") || {
+      STEP_DETAILS='unable to query konflux-release-data for CDN RPAs'
+      return "${OCR_RC_BLOCKED}"
+    }
+    rpa_count=$(jq --arg mm "${MM_DASHED}" \
+      '[.[] | select(.name | contains($mm) and contains("cdn"))] | length' <<<"${rpa_data}")
+    if ((rpa_count < 2)); then
+      STEP_DETAILS="CDN RPAs: ${rpa_count} (expected >=2)"
+      return "${OCR_RC_BLOCKED}"
+    fi
+  fi
 
-  base="${GITLAB_URL}/api/v4/projects/releng%2Fkonflux-release-data/repository/tree"
+  # ── Part 2: ALL ReleasePlans have correct version tags (3-field check) ──
+  ocr_require_konflux || return $?
+  local rps rp_total bad_tags
+  rps=$(ocr_oc_get releaseplans -o json 2>/dev/null) || {
+    STEP_DETAILS='unable to query ReleasePlans'
+    return "${OCR_RC_BLOCKED}"
+  }
+  rp_total=$(jq --arg mm "${MM_DASHED}" \
+    '[.items[] | select(.metadata.name | contains($mm))] | length' <<<"${rps}")
+  if ((rp_total == 0)); then
+    STEP_DETAILS="no ReleasePlans found matching ${MM_DASHED}"
+    return "${OCR_RC_BLOCKED}"
+  fi
+  bad_tags=$(jq -r --arg mm "${MM_DASHED}" --arg vtag "v${VERSION}" --arg ver "${VERSION}" '
+    [.items[] | select(.metadata.name | contains($mm))
+      | select(
+          ([.spec.data.mapping.defaults.tags[]? | select(startswith($vtag))] | length) == 0
+          and
+          ([.spec.tenantPipeline.params[]? | select(.name == "release_version" and (.value | startswith($vtag)))] | length) == 0
+          and
+          ((.spec.data.mapping.defaults.contentGateway.productVersionName // "") | startswith($ver) | not)
+        )]
+    | .[].metadata.name' <<<"${rps}")
+  if [[ -n "${bad_tags}" ]]; then
+    local bad_count
+    bad_count=$(wc -l <<<"${bad_tags}" | tr -d ' ')
+    STEP_DETAILS="${rp_total} RPs checked; ${bad_count} missing v${VERSION} tag: ${bad_tags//$'\n'/, }"
+    return "${OCR_RC_BLOCKED}"
+  fi
 
-  # RPA check — flat files, works as before
-  rpa=$(ocr_gitlab_get "${base}?path=config/kflux-prd-rh02.0fk9.p1/product/ReleasePlanAdmission/tekton-ecosystem&ref=main&per_page=100") || return "${OCR_RC_BLOCKED}"
-  rpa_count=$(jq --arg mm "${MM_DASHED}" '[.[] | select(.name | contains($mm) and contains("cdn"))] | length' <<<"${rpa}")
+  # ── Part 3: CDN ReleasePlans have RP/RPA handshake completed (active: true) ──
+  local cdn_rps cdn_rp active handshake_failures='' cdn_count=0
+  cdn_rps=$(jq -r --arg mm "${MM_DASHED}" '
+    .items[] | select(.metadata.name | contains($mm) and contains("cdn"))
+    | .metadata.name' <<<"${rps}")
+  if [[ -z "${cdn_rps}" ]]; then
+    STEP_DETAILS="${rp_total} RPs verified with v${VERSION} tags; no CDN RPs found for handshake check"
+    return "${OCR_RC_BLOCKED}"
+  fi
+  while IFS= read -r cdn_rp; do
+    [[ -n "${cdn_rp}" ]] || continue
+    ((cdn_count += 1))
+    active=$(ocr_oc_get releaseplan "${cdn_rp}" -o jsonpath='{.status.releasePlanAdmission.active}' 2>/dev/null || true)
+    if [[ "${active}" != "true" ]]; then
+      handshake_failures+=" ${cdn_rp}"
+    fi
+  done <<<"${cdn_rps}"
 
-  # Tenant RP check — look inside the version subdirectory for multi-doc YAMLs
-  # containing CDN ReleasePlan documents
-  local tenant_subdir="tenants-config/cluster/kflux-prd-rh02/tenants/tekton-ecosystem-tenant/openshift-pipelines-${mm_dot}"
-  local encoded_subdir
-  encoded_subdir=$(printf '%s' "${tenant_subdir}" | sed 's|/|%2F|g')
-
-  rp_count=0
-  rp_sub=$(ocr_gitlab_get "${base}?path=$(printf '%s' "${tenant_subdir}" | jq -sRr @uri)&ref=main&per_page=100" 2>/dev/null) || rp_sub="[]"
-
-  # For each YAML file in the tenant subdirectory, fetch its content
-  # and count YAML documents whose metadata.name contains "cdn"
-  local rp_file rp_file_path rp_content cdn_docs
-  while IFS= read -r rp_file; do
-    [[ -n "${rp_file}" ]] || continue
-    rp_file_path="${tenant_subdir}/${rp_file}"
-    local encoded_path
-    encoded_path=$(printf '%s' "${rp_file_path}" | sed 's|/|%2F|g')
-    rp_content=$(ocr_gitlab_get \
-      "${GITLAB_URL}/api/v4/projects/releng%2Fkonflux-release-data/repository/files/${encoded_path}/raw?ref=main" \
-      2>/dev/null) || continue
-    # Count YAML documents with "cdn" in metadata.name
-    cdn_docs=$(grep -c "name:.*cdn" <<<"${rp_content}" || true)
-    rp_count=$((rp_count + cdn_docs))
-  done < <(jq -r '.[] | select(.type == "blob" and (.name | endswith(".yaml"))) | .name' <<<"${rp_sub}")
-
-  # Auto-generated check — keep as-is (flat directory)
-  auto=$(ocr_gitlab_get "${base}?path=tenants-config/auto-generated/cluster/kflux-prd-rh02/tenants/tekton-ecosystem-tenant&ref=main&per_page=100") || return "${OCR_RC_BLOCKED}"
-  auto_count=$(jq --arg mm "${MM_DASHED}" '[.[] | select(.name | contains($mm) and contains("cdn"))] | length' <<<"${auto}")
-
-  STEP_DETAILS="CDN RPAs: ${rpa_count}; tenant RPs: ${rp_count}; auto-generated RPs: ${auto_count}"
-  ((rpa_count >= 2 && rp_count >= 1)) || return "${OCR_RC_BLOCKED}"
+  if [[ -n "${handshake_failures}" ]]; then
+    STEP_DETAILS="${rp_total} RPs verified with v${VERSION} tags; CDN RP/RPA handshake not active:${handshake_failures}"
+    return "${OCR_RC_BLOCKED}"
+  fi
+  STEP_DETAILS="CDN RPAs: ${rpa_count}; ${rp_total} RPs verified with v${VERSION} tags; ${cdn_count} CDN RP(s) handshake active"
 }
 
 ocr_verify_step() {
