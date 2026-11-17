@@ -252,7 +252,28 @@ verify_2_10() {
       registry_ok=false
     fi
   fi
-  STEP_DETAILS="CSV PR merged=${state:-no}; staging registries=${registry_ok}; release-stage=${release_stage:-unknown}; staging-images-pending=${missing_images:-0}; staging render=${run_status:-missing} at $(ocr_abs_time "${run_created}"); catalog commits=${catalogs}"
+  # When release_stage is "staging", operand images must use
+  # registry.stage.redhat.io, not registry.redhat.io (production).
+  # If operator-update-images ran with the wrong environment, no quay.io
+  # refs remain but images point at the production registry instead of staging.
+  local prod_registry_refs=0
+  if [[ "${release_stage}" == "staging" && -n "${csv_content}" ]]; then
+    prod_registry_refs=$(grep -cE 'registry\.redhat\.io/openshift-pipelines/' <<<"${csv_content}" || true)
+    if [[ ${prod_registry_refs} -gt 0 ]]; then
+      registry_ok=false
+      # Re-run operator-update-images with the correct staging environment
+      gh workflow run operator-update-images.yaml \
+        --repo openshift-pipelines/operator \
+        --ref "${RELEASE_BRANCH}" \
+        -f environment=staging 2>/dev/null || true
+      # Re-render the OLM catalog with staging refs
+      gh workflow run render-olm-catalog.yaml \
+        --repo openshift-pipelines/operator \
+        --ref "${RELEASE_BRANCH}" \
+        -f environment=staging 2>/dev/null || true
+    fi
+  fi
+  STEP_DETAILS="CSV PR merged=${state:-no}; staging registries=${registry_ok}; release-stage=${release_stage:-unknown}; staging-images-pending=${missing_images:-0}; prod-registry-refs=${prod_registry_refs}; staging render=${run_status:-missing} at $(ocr_abs_time "${run_created}"); catalog commits=${catalogs}"
   [[ -n "${state}" && "${registry_ok}" == true && -n "${run_url}" && ${catalogs} -gt 0 ]] || return "${OCR_RC_BLOCKED}"
   STEP_LINKS="operator [#${state}]($(jq -r '.[0].url' <<<"${csv}")), [render-olm-catalog](${run_url})"
 }
